@@ -1,0 +1,200 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+
+```{r}
+library(rjson)
+library(dplyr)
+library(stringr)
+library(tidytext)
+library(ggplot2)
+library(keras)
+library(purrr)
+library(caret)
+```
+
+
+```{r}
+tweets <- fromJSON(file = "tweets.json")
+users <- read.csv("labeled_users.csv")
+users <- users %>% 
+  select(user_id = screen_name, age = human.labeled.age, gender = human.labeled.gender) %>%
+  mutate(under_21 = ifelse(age < 21, 1, 0 ))
+
+
+table(users$gender)
+
+ggplot(users)+
+  geom_bar(aes(x=age)) +
+  xlim(10,35)+
+  labs(title = "User ages")+
+  theme_bw()
+
+word_frequency <- data.frame()
+data(stop_words)
+```
+
+
+```{r}
+for (i in (1:length(tweets))) {
+  
+  df <- paste(tweets[i], sep = " ")
+  
+  df.words <- data.frame(text = df) %>%
+    unnest_tokens(output = word, input = text)
+
+  df.words  <- df.words  %>% 
+    filter (word != "https" & word != "t.co" & word != "http") %>%
+    anti_join(stop_words)
+  
+  df.wordcount <- df.words %>% count(word, sort = TRUE)
+  
+  df.wordcount$user_id <- names(tweets)[i]
+  
+  word_frequency <- rbind(word_frequency, df.wordcount)
+  
+}
+```
+
+
+```{r}
+
+word_frequency <- merge(word_frequency, users, by = "user_id", all.X = TRUE)
+
+ggplot(word_frequency)+
+  geom_bar(aes(x=age)) +
+  xlim(10, 35)
+
+df <- word_frequency %>% 
+  group_by(age, word) %>%
+  summarize(n_individuals = n_distinct(user_id))
+
+under21 <- df %>% filter (age < 21) %>% arrange(desc(n_individuals))
+above21 <- df %>% filter (age >= 21) %>% arrange(desc(n_individuals))
+
+under21.1 <- under21 %>% filter(!(word %in% above21$word)) %>% group_by(word) %>% summarize(n = sum(n_individuals))
+
+above21.1 <- above21 %>% filter(!(word %in% under21$word)) %>% group_by(word) %>% summarize(n = sum(n_individuals))
+
+test <- word_frequency %>%
+  mutate(above21score = case_when(word == "car" ~ n*2,
+                                  word == "0001f440" ~ n*2,
+                                  word == "left" ~ n*2,
+                                  word == "0001f923" ~ n*2,
+                                  word == "tomorrow" ~ n*2,
+                                  word == "morning" ~ n*2,
+                                  word == "feels" ~ n*2,
+                                  word == "weeks" ~ n*2,
+                                  word == "dude" ~ n*2,
+                                  word == "i'd" ~ n *2,
+                                  word == "2640" ~ n*-2,
+                                  word == "girls" ~ n*-2,
+                                  word == "told" ~ n*-2,
+                                  word == "ur" ~ n*-2,
+                                  word == "0001f495" ~ n*-2)) %>%
+  group_by(user_id, age) %>%
+  summarize (above21score = sum(above21score, na.rm = TRUE)) %>%
+  mutate(above21pred = ifelse(above21score < 0, 0, 1),
+         above21actual = ifelse(age < 21, 0, 1))
+
+plot(test$age, test$above21score)
+length(which(test$above21score < 0))
+  
+```
+
+```{r}
+tweets <- fromJSON(file = "tweets.json")
+users <- read.csv("labeled_users.csv")
+users <- users %>% 
+  select(user_id = screen_name, age = human.labeled.age, gender = human.labeled.gender) %>%
+  mutate(under_21 = ifelse(age < 21, 1, 0 ))
+
+df <- data.frame(user_id = names(tweets), text = character(length = length(names(tweets))))
+
+for (i in (1:length(tweets))) {
+  
+  temp <- paste( unlist(tweets[i]), collapse = " ")
+  clean_tweet = gsub("&amp", "", temp)
+  clean_tweet = gsub("(RT|via)((?:\\b\\W*@\\w+)+)", "", clean_tweet)
+  clean_tweet = gsub("@\\w+", "", clean_tweet)
+  clean_tweet = gsub("[[:punct:]]", "", clean_tweet)
+  clean_tweet = gsub("[[:digit:]]", " ", clean_tweet)
+  clean_tweet = gsub("http\\w+", "", clean_tweet)
+  clean_tweet = gsub("[ \t]{2,}", "", clean_tweet)
+  clean_tweet = gsub("^\\s+|\\s+$", "", clean_tweet) 
+  
+  df$text[i] <- clean_tweet
+}
+
+df <- merge(df, users, by = "user_id")
+
+df <- df %>% filter(!is.na(under_21))
+
+training_id <- sample.int(nrow(df), size = nrow(df)*0.8)
+training <- df[training_id,]
+testing <- df[-training_id,]
+
+#----------------------------------------------
+
+num_words <- 10000
+max_length <- 50
+text_vectorization <- layer_text_vectorization(
+  max_tokens = num_words, 
+  output_sequence_length = max_length, 
+)
+
+text_vectorization %>% 
+  adapt(df$text)
+
+input <- layer_input(shape = c(1), dtype = "string")
+
+output <- input %>% 
+  text_vectorization() %>% 
+  layer_embedding(input_dim = num_words + 1, output_dim = 16) %>%
+  layer_global_average_pooling_1d() %>%
+  layer_dense(units = 16, activation = "relu") %>%
+  layer_dropout(0.5) %>% 
+  layer_dense(units = 1, activation = "sigmoid")
+
+model <- keras_model(input, output)
+
+model %>% compile(
+  optimizer = 'adam',
+  loss = 'binary_crossentropy',
+  metrics = list('accuracy')
+)
+
+
+history <- model %>% fit(
+  training$text,
+  training$under_21,
+  epochs = 100,
+  batch_size = 512,
+  validation_split = 0.2,
+  verbose=2,
+  callback_early_stopping(patience = 2)
+)
+
+testing$age_prob <- predict(model, testing$text)
+
+testing <- testing %>% arrange(desc(age_prob)) %>% mutate(age_pred = ifelse(row_number() <= 86, 1, 0))
+
+confusionMatrix(factor(testing$age_pred), factor(testing$under_21))
+
+```
+
+```{r}
+corpus <- VCorpus(VectorSource(training$text))
+
+tdm <- DocumentTermMatrix(corpus, list(removePunctuation = TRUE, stopwords = TRUE, stemming = TRUE, removeNumbers = TRUE))
+train <- as.matrix(tdm)
+train <- cbind(train, c(0, 1))
+colnames(train)[ncol(train)] <- 'y'
+
+```
+
+
+
+
